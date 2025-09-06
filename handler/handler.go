@@ -15,33 +15,111 @@ import (
 	"github.com/runabol/tork/middleware/web"
 )
 
+// ExecRequest representa o request de execução enviado pelo cliente.
 type ExecRequest struct {
 	Code     string `json:"code"`
 	Language string `json:"language"`
 	Input    string `json:"input"`
 }
 
-var debug_valgrind = false
+// ErrorMsg descreve um erro retornado pelo compilador ou em tempo de execução.
+type ErrorMsg struct {
+	Event        string `json:"event"`
+	ExceptionMsg string `json:"exception_msg"`
+	Line         int    `json:"line"`
+	Column       int    `json:"column"`
+}
 
-func Handler(c web.Context) error {
-	er := ExecRequest{}
+// Ret representa a resposta em caso de erro de compilação.
+type Ret struct {
+	Code     string   `json:"code"`
+	ErrorMsg ErrorMsg `json:"error"`
+}
 
-	if err := c.Bind(&er); err != nil {
-		c.Error(http.StatusBadRequest, errors.Wrapf(err, "error binding request"))
+// sanitizeInput validates an input string by checking that it contains only
+// allowed characters.
+// Returns `true` if the input matches the expected pattern, `false` otherwise.
+func sanitizeInput(input string) bool {
+	// 1. Delimitadores:
+	//    ^			--> início da string
+	//    $			--> fim da string
+	//
+	//    Isso garante que toda a string deve obedecer ao padrão, não apenas uma
+	//    parte dela.
+	//
+	//
+	// 2. Grupo principal:
+	//    (...)*	--> significa que a sequência interna pode se repetir 0 ou
+	// 					mais vezes.
+	//
+	//    2.1 Conteúdo do grupo
+	//		  [\p{Latin}\p{N}]*	--> qualquer número (0 ou mais) de letras latinas
+	// 								ou números.
+	// 		  \p{N}+[.,]\p{N}+	--> números que podem ter ponto ou vírgula no meio.
+	//		  |					--> "ou", então o grupo aceita letras/números
+	// 								simples ou números decimais.
+	//		  [\s\n]*			--> aceita 0 ou mais espaços ou quebras de linha
+	// 								após o grupo anterior.
+	pattern := regexp.MustCompile(`^(([\p{Latin}\p{N}]*|\p{N}+[.,]\p{N}+)[\s\n]*)*$`)
+	return pattern.MatchString(input)
+}
+
+// Helper function to safely convert string to integer
+func toInt(str string) int {
+	val, err := strconv.Atoi(str)
+	if err != nil {
+		return 0
+	}
+	return val
+}
+
+var debugValgrind = false
+
+// Handler trata requisições HTTP para execução de código enviado pelo usuário.
+func Handler(context web.Context) error {
+	// Objeto que representa a requisição do usuário.
+	userRequest := ExecRequest{}
+
+	// Tenta decodificar o corpo da requisição HTTP para dentro da struct
+	// `userRequest`.
+	//
+	// Caso o conteúdo da requisição não corresponda ao formato esperado, o
+	// método `Bind` retorna um erro. Nesse caso, respondemos imediatamente com
+	// um erro HTTP 400 (Bad Request), informando que a requisição do cliente é
+	// inválida.
+	if err := context.Bind(&userRequest); err != nil {
+		context.Error(http.StatusBadRequest, errors.Wrapf(err, "error binding request"))
 		return nil
 	}
 
-	er.Input = strings.TrimSpace(er.Input)
-	if !sanitizeInput(er.Input) {
-		log.Debug().Msgf("invalid_input: \"%s\"", er.Input)
-		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invalid_input"})
+	// Remove espaços em branco extras do início e do fim do campo `Input` para
+	// evitar inconsistências durante a validação.
+	userRequest.Input = strings.TrimSpace(userRequest.Input)
+
+	// Valida o conteúdo do campo `Input` usando a função `sanitizeInput`.
+	//
+	// Caso a validação falhe, significa que o cliente enviou uma entrada inválida.
+	// Nesse cenário:
+	//   1. É registrado um log em nível de debug mostrando o valor rejeitado.
+	//   2. Retorna-se imediatamente uma resposta HTTP 400 (Bad Request), no formato
+	// 		JSON, informando que a entrada é inválida.
+	if !sanitizeInput(userRequest.Input) {
+		log.Debug().Msgf("invalid_input: \"%s\"", userRequest.Input)
+		return context.JSON(http.StatusBadRequest, map[string]string{"message": "invalid_input"})
 	}
 
-	log.Debug().Msgf("%s", er.Code)
+	// Registra em nível de debug o código-fonte enviado pelo cliente através do
+	// campo `Code`. 
+	log.Debug().Msgf("%s", userRequest.Code)
 
-	task, err := buildTask(er)
+	// Constrói a definição da tarefa que será submetida ao engine, a partir dos
+	// dados recebidos no objeto `userRequest`.
+	//	
+	// Caso a construção da tarefa falhe, retorna-se imediatamente um erro
+	// HTTP 400 (Bad Request).
+	task, err := buildTask(userRequest)
 	if err != nil {
-		c.Error(http.StatusBadRequest, err)
+		context.Error(http.StatusBadRequest, err)
 		return nil
 	}
 
@@ -60,10 +138,10 @@ func Handler(c web.Context) error {
 		Tasks: []input.Task{task},
 	}
 
-	job, err := engine.SubmitJob(c.Request().Context(), inputN, listener)
+	job, err := engine.SubmitJob(context.Request().Context(), inputN, listener)
 
 	if err != nil {
-		c.Error(http.StatusBadRequest, errors.Wrapf(err, "error executing code"))
+		context.Error(http.StatusBadRequest, errors.Wrapf(err, "error executing code"))
 		return nil
 	}
 
@@ -71,8 +149,8 @@ func Handler(c web.Context) error {
 
 	select {
 	case r := <-result:
-		if debug_valgrind {
-			return c.JSON(http.StatusOK, r)
+		if debugValgrind {
+			return context.JSON(http.StatusOK, r)
 		} else {
 			// Define the regex pattern with the filename "usercode.c"
 			pattern := `usercode(.c|.cpp):(\d+):(\d+):.+?(error:.*)`
@@ -88,27 +166,22 @@ func Handler(c web.Context) error {
 				if err := json.Unmarshal([]byte(r), &jsonData); err != nil {
 					log.Debug().Msgf("unknown_json_parsing_error: %s", err.Error())
 					log.Debug().Msg(r)
-					return c.JSON(http.StatusBadRequest, map[string]string{"message": "unknown_error"})
+					return context.JSON(http.StatusBadRequest, map[string]string{"message": "unknown_error"})
 				}
-				return c.JSON(http.StatusOK, jsonData)
+				return context.JSON(http.StatusOK, jsonData)
 			} else {
-				err := json.Unmarshal([]byte(handleGccError(er.Code, r)), &jsonData)
+				err := json.Unmarshal([]byte(handleGccError(userRequest.Code, r)), &jsonData)
 				if err != nil {
 					return err
 				}
-				return c.JSON(http.StatusBadRequest, jsonData)
+				return context.JSON(http.StatusBadRequest, jsonData)
 			}
 
 		}
 
-	case <-c.Done():
-		return c.JSON(http.StatusGatewayTimeout, map[string]string{"message": "timeout"})
+	case <-context.Done():
+		return context.JSON(http.StatusGatewayTimeout, map[string]string{"message": "timeout"})
 	}
-}
-
-func sanitizeInput(input string) bool {
-	re := regexp.MustCompile(`^(([\p{Latin}\p{N}]*|\p{N}+[.,]\p{N}+)[\s\n]*)*$`)
-	return re.MatchString(input)
 }
 
 func buildTask(er ExecRequest) (input.Task, error) {
@@ -150,7 +223,7 @@ func buildTask(er ExecRequest) (input.Task, error) {
 			// If the TORK_OUTPUT is not empty, i.e., an error happened, do nothing
 			"[ -s \"${TORK_OUTPUT}\" ] || "
 
-	if debug_valgrind {
+	if debugValgrind {
 		run += "cat /tmp/user_code/usercode.vgtrace > $TORK_OUTPUT"
 	} else {
 		run += "python3 /tmp/parser/wsgi_backend.py " + language + " > $TORK_OUTPUT"
@@ -169,27 +242,6 @@ func buildTask(er ExecRequest) (input.Task, error) {
 			filename: er.Code,
 		},
 	}, nil
-}
-
-// Helper function to safely convert string to integer
-func toInt(s string) int {
-	val, err := strconv.Atoi(s)
-	if err != nil {
-		return 0
-	}
-	return val
-}
-
-type ErrorMsg struct {
-	Event        string `json:"event"`
-	ExceptionMsg string `json:"exception_msg"`
-	Line         int    `json:"line"`
-	Column       int    `json:"column"`
-}
-
-type Ret struct {
-	Code     string   `json:"code"`
-	ErrorMsg ErrorMsg `json:"error"`
 }
 
 func handleGccError(code string, gccStderr string) string {
